@@ -1,0 +1,409 @@
+---
+title: "xgb_analysis"
+author: "Kelvin Koser & Michael Welsh"
+date: "06/06/2023"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+This Rmarkdown file uses machine learning to try and answer the question: "Can expression of specific genes be used to predict a breast cancer patient's chance of survival?" This dataset was retrieved from https://www.kaggle.com/datasets/raghadalharbi/breast-cancer-gene-expression-profiles-metabric, which was derived from the Molecular Taxonomy of Breast Cancer International Consortium (METABRIC) database. Tumor samples were collected from 1907 breast cancer patients and the relative RNA expression values of 489 genes for each patient was determined using RNASeq. These values were z-score normalized. Whether or not the patient surived within two years was recorded as part of the study, and serves as a label for our supervised machine learning. This markdown first does some exploratory data analysis, then trains a classifier to predict patient survival using XGBoost via the package Caret.
+
+# Setup
+Load necessary packages and set training log.
+
+```{r setup}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	fig.align = "center",
+	fig.height = 4,
+	fig.width = 6,
+	message = FALSE,
+	warning = FALSE,
+	tidy = TRUE,
+	tidy.opts = list(width.cutoff = 60)
+)
+#load packages
+if (!require("pacman")) install.packages("pacman", "CRAN")
+library(pacman)
+pacman::p_load(tidyverse, FactoMineR, caret, readr, doParallel, dplyr, stringr, xgboost, data.table, glue, factoextra, kableExtra)
+
+#setup parallel & output log
+num_cores <- detectCores()
+cl <- makePSOCKcluster(num_cores - 1, outfile = glue('training_log_{Sys.Date()}.txt'))
+registerDoParallel(cl)
+```
+
+
+# Load dataset & simplify
+
+Let's load the dataset and simplify the label to either "died" or "survived." 
+
+```{r}
+#load raw data
+data_raw <- fread('data_rna_expression.csv')
+
+#remove data without phenotype & condense to 2 phenotypes
+data <- data_raw %>% 
+  filter(death_from_cancer != '') %>% 
+  mutate(death_from_cancer = str_replace(death_from_cancer, 'Died of Disease', 'Died'),
+         death_from_cancer = str_replace(death_from_cancer, 'Died of Other Causes', 'Died'),
+         death_from_cancer = str_replace(death_from_cancer, 'Living', 'Survived'))
+
+#factor label
+data$death_from_cancer <- factor(data$death_from_cancer)
+
+data %>%
+  select(c(colnames(data)[1:10], death_from_cancer)) %>%
+  head %>%
+  knitr::kable('html', booktabs = TRUE) %>%
+  kable_styling('striped')
+```
+
+Looks like our final dataset has 1903 samples, with expression values for all 489 genes.
+
+# Exploratory data analysis
+
+## Proportion of each class
+
+Let's see how many samples are from patients that died versus survived.
+
+```{r}
+data %>%
+  ggplot(aes(x = death_from_cancer, fill = death_from_cancer)) +
+  geom_bar() +
+  theme_bw() +
+  labs(title = 'Total Number of Samples Per Class')
+```
+
+It looks like we have a few more samples from patients that died as opposed to survived. This is something that we may want to keep in mind.
+
+
+## Dimensionality Analysis & Reduction
+
+There are many features (genes) in this dataset (489). Thus, it's quite difficult to see if there is an overall difference between those that survived and those that did not across these 489 genes/features (we can't draw a plot with 489 axes!). Let's use principal component analysis (PCA) to see: (1) if there is a substantial difference between these two sub-populations when considering all 489 genes and (2) if we can reduce the number of dimensions (features) necessary to do so. This is called feature extraction.
+
+Let's try to reduce the feature space using PCA.
+
+```{r}
+#subset to just values
+data_vals <- data %>% dplyr::select(-c('death_from_cancer'))
+
+#plot pca
+pca_res <- PCA(data_vals, scale.unit = TRUE, graph = FALSE)
+fviz_pca_ind(pca_res, label = 'none', habillage = data$death_from_cancer, addEllipses = TRUE)
+
+
+#plot explained variance (screeplot)
+fviz_screeplot(pca_res, ncp = 50)
+```
+
+Based on this, it looks like we can't use PCA to distinguish between those that died and those that survived. This is evident in the high degree of overlap between the two sample sets. The scree plot shows that many dimensions are necessary to account for most of the variance across the dataset (not even 50 is sufficient). This is worrisome, but let's do some machine learning to see if we can build a binary classifier using all 489 features.
+
+
+# Train a Machine Learning Classifier
+
+## Partition data into train and test sets
+
+For our machine learning (ML) components we are going to use the package Caret. So if you aren't familiar with the syntax pertaining to it please refer to the documentation here: https://github.com/topepo/caret. 
+
+The train set will be utilized for tuning, while the test set will be held out until the end. Let's put 80% of the data in the training set and use the remaining 20% for evaluation.
+
+```{r}
+#seed for reproducibility
+set.seed(1234)
+
+#make split
+trainIndex <- createDataPartition(data$death_from_cancer, p = .8, list = FALSE, times = 1)
+train_set <- data[trainIndex,]
+test_set <- data[-trainIndex,]
+
+#save
+write_csv(train_set, file = 'train_set.csv', col_names = TRUE)
+write_csv(test_set, file = 'test_set.csv', col_names = TRUE)
+
+#let's ensure the frequence of living vs. died stays relatively consistent between the train and test sets.
+print('Frequency in train set')
+train_set$death_from_cancer %>% table() %>% proportions()
+print('Frequency in test set')
+test_set$death_from_cancer %>% table() %>% proportions()
+```
+
+These look roughly proportional. Great! Let's train.
+
+
+## Baseline training using default xgboost parameters
+
+We are going to use XGBoost, a decision tree-based ensembling algorithm to train a classifer. Let's first try using XGBoost fresh out of the box with default settings.
+
+```{r message=FALSE, warning=FALSE}
+#set up grid for grid search
+grid_default <- expand.grid(
+   nrounds = 100, # num of trees in final model
+   max_depth = 6, # num of nodes in longest path from root to furthest leaf
+   eta = 0.3, #learning rate
+   gamma = 0, #minimum loss reduction need to make further partition
+   colsample_bytree = 1, #subsample ratio of training instances
+   min_child_weight = 1, #min sum of instance weight needed in a child node
+   subsample = 1) #amount of training instances sampled
+
+
+
+#define training control (settings for during training)
+train_ctrl <- trainControl(method = 'none',
+                            verboseIter = TRUE,
+                            classProbs = TRUE,
+                            allowParallel = TRUE)
+
+#train
+xgb_base <- caret::train(death_from_cancer~.,
+                          data = train_set,
+                          trControl = train_ctrl,
+                          tuneGrid = grid_default,
+                          method = 'xgbTree',
+                          verbose = TRUE)
+ 
+#save
+save(xgb_base, file = 'xgb_base.RData')
+
+#load if necessary
+load('xgb_base.RData')
+
+#evaluate on test set
+model_predict <- predict(xgb_base, test_set)
+
+#create confusion matrix to analyze results
+model_confuse <- confusionMatrix(model_predict, as.factor(test_set$death_from_cancer))
+model_confuse
+```
+
+Training with default parameters results in an accuracy of ~63%. Let's make a heatmap to better visualize the confusion matrix. We're going to do this several times, so we'll make it a function
+
+```{r}
+#define function
+color_confmat <- function(confusion_mat) {
+  #add in percentages/proportions
+  perc_df <- confusion_mat$table %>%
+    prop.table() %>%
+    as.data.frame() %>%
+    mutate(perc = round(Freq*100, 2)) %>%
+    select(-Freq)
+  
+  #make heatmap
+  heatmap_conf <- confusion_mat$table %>%
+    as.data.frame() %>% 
+    full_join(perc_df) %>%
+    mutate(Prediction = factor(Prediction, levels = c('Survived', 'Died')),
+           Reference = factor(Reference, levels = c('Died', 'Survived'))) %>%
+    ggplot(aes(x=Reference, y=Prediction, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = paste(Freq, "\n", "(", perc, "%)")), size = 5) +
+    theme_bw() +
+    scale_fill_gradient(low = '#D6EAF8', high = '#2E86C1')
+  
+  return(heatmap_conf)
+  }
+
+color_confmat(model_confuse)
+
+```
+
+Ah! It looks like we are correctly calling "dead" individuals "dead" more often than not, although this is not the case for the "survived" class. Individuals who had "survived" were predicted to be "dead" more often than "survived". That's not good! This is likely due to a high degree of overlap between "died" and "survived" individuals in terms of expression of these 489 genes, as we saw previously using the PCA. The somewhat considerable imbalance of classes may be further adding to this disparity. 
+
+
+## Hyperparameter tuning using cross validation
+
+One thing we did not do above is tune the hyperparameters while training. Not doing this could potentially lead to over or under-fitting of the model to the train set, which could account for poor performance when evaluating on the test set. Thus, it's generally considered best practice to always tune hyperparameters during training. XGBoost has a plethora of hyperparameters to tune; we are going to tinker with only a few of them. Additionally, we will use cross-validation when performing hyperparameter tuning to prevent overfitting on the train set. Let's use 5-fold cross-validation, with 2 repeats (thus, there are 10 random sub-folds generated from the train set).
+
+```{r}
+#set tune grid
+tune_grid <- expand.grid(
+   nrounds = seq(50, 500, 50),
+   eta = c(.001, .01),
+   max_depth = c(2, 5, 10, 20),
+   gamma = 0,
+   colsample_bytree = 1,
+   min_child_weight = 1, 
+   subsample = 1)
+ 
+#set up training control
+tune_ctrl <- trainControl(
+   method = 'repeatedcv',
+   number = 5,
+   repeats = 2,
+   verboseIter = TRUE,
+   allowParallel = TRUE)
+ 
+ 
+ 
+#train
+xgb_tune <- caret::train(death_from_cancer~.,
+                         data = train_set,
+                         trControl = tune_ctrl,
+                         tuneGrid = tune_grid,
+                         method = 'xgbTree',
+                         verbose = TRUE)
+
+#save 
+save(xgb_tune, file = 'xgb_tune.RData')
+
+#load if necessary
+load('xgb_tune.RData')
+#evaluate on test set
+tune_predict <- predict(xgb_tune, test_set)
+
+#create confusion matrix to analyze results
+tune_confuse <- confusionMatrix(tune_predict, as.factor(test_set$death_from_cancer))
+tune_confuse
+color_confmat(tune_confuse)
+```
+
+These results look rather similar to the baseline non-tuning one. Thus, the default parameters are likely sufficient for this dataset.
+
+### Plot kfold/resampling accuracies
+
+To ensure our model was not overfit on the training set, let's plot the accuracy for each fold of the cross-validated train set.
+
+```{r}
+fold_acc <- xgb_tune$resample
+
+fold_acc %>%
+  mutate(placeholder = 'placeholder') %>%
+  ggplot(aes(x = placeholder, y = Accuracy, fill = placeholder)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(size = 4, width = .25) +
+  theme_bw() +
+  labs(
+    title = 'Mean accuracy for each fold/resample using optimal hyperparameters',
+    x = '',
+    y = 'Mean Accuracy'
+  ) +
+  theme(
+    axis.text.x=element_blank(),
+    axis.ticks.x=element_blank(),
+    title = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10),
+    legend.position = 'none')
+
+```
+
+Very nice! It looks like our test set accuracy (~63%) falls within our cross-validation/fold accuracy interquartile range (IQR), so we did not overfit to the train set.
+
+
+## Feature Selection
+
+Often times a model can be improved by reducing the feature space (i.e. number of features). This generally helps to reduce computational time and in some cases can help elucidate the features most useful to the model. We tried doing this previously using PCA, although there are two reasons as to why we did not end up using it to reduce our feature space:
+
+1. Firstly, performing PCA is technically considered feature extraction, in that by doing so we "lose" the original features (in this case genes), and generate a new set of features (i.e. dimensions). This is not desirable if the names of specific genes are important and/or desired.
+2. Secondly, performing PCA did not reduce the number of features necessary to perform this classification. So even if we WANTED to use it, doing so would provide not benefit in this situation.
+
+### Variable importance
+
+XGBoost has a built-in metric termed 'Variable Importance', which is the information gain provided by each given feature. Thus, we can sort and rank features based on their relative importance to the model. A common technique is to first train a model, then use variable importance to reduce to a reduced set of features that may can achieve results comparable to a model trained with all features. Here we will do just that. Let's start by plotting 
+
+
+```{r}
+varImp(xgb_tune)$importance %>%
+  as.data.frame() %>%
+  rownames_to_column(var = 'feature') %>%
+  mutate(enumerate = seq(1, nrow(.), 1)) %>%
+  ggplot(aes(x = enumerate, y = Overall)) +
+  geom_point(color = 'blue') +
+  geom_line(size = 1, color = 'blue') +
+  theme_bw() +
+  geom_vline(xintercept = 112, color = 'orange', size = 1.25) +
+  scale_x_continuous(limits = c(0, 489), expand = expansion(mult = c(0,0))) +
+  scale_y_continuous(limits = c(0, 100), expand = expansion(mult = c(0,0))) +
+  labs(
+    title = 'XGBoost identified 112 features as important',
+    x = '',
+    y = 'Relative Variable Importance') +
+  theme(title = element_text(size = 15),
+        axis.title = element_text(size = 15),
+        axis.text = element_text(size = 13))
+```
+
+It looks like only 112 of our 489 features (genes) were deemed as important by XGBoost. This means that it did not use the other 377 features during training and as such they can be removed. Let's do that next, then train and evaluate a new model.
+
+
+### train & predict
+
+```{r}
+#extract important features
+imp_features <- varImp(xgb_tune)$importance %>%
+  as.data.frame() %>%
+  rownames_to_column(var = 'feature') %>%
+  mutate(enumerate = seq(1, nrow(.), 1)) %>%
+  filter(Overall > 0) %>%
+  pull(feature)
+
+#subset dataframe
+data_imp <- data %>%
+  dplyr::select(c(imp_features, 'death_from_cancer'))
+
+set.seed(5678)
+trainIndex <- createDataPartition(data_imp$death_from_cancer, p = .8, list = FALSE, times = 1)
+
+train_set_imp <- data_imp[trainIndex,]
+test_set_imp <- data_imp[-trainIndex,]
+save(train_set_imp, file = 'train_set_imp.RData')
+save(test_set_imp, file = 'test_set_imp.RData')
+ 
+xgb_tune_imp <- caret::train(death_from_cancer~.,
+                             data = train_set_imp,
+                             trControl = tune_ctrl,
+                             tuneGrid = tune_grid,
+                             method = 'xgbTree',
+                             verbose = TRUE)
+
+save(xgb_tune_imp, file = 'xgb_tune_imp.RData')
+
+
+load('xgb_tune_imp.RData')
+
+#evaluate on test set
+tune_imp_predict <- predict(xgb_tune_imp, test_set_imp)
+
+#create confusion matrix to analyze results
+tune_imp_confuse <- confusionMatrix(tune_imp_predict, as.factor(test_set_imp$death_from_cancer))
+tune_imp_confuse
+color_confmat(tune_imp_confuse)
+```
+
+Very nice! By reducing our feature space we actually improved performance slightly. Also, although we didn't record time benchmarks, reducing the feature space will also reduce the amount of computational time. Let's plot the accuracy across folds to ensure we didn't overfit.
+
+
+## Plot kfold/resampling accuracies
+
+```{r}
+fold_acc <- xgb_tune_imp$resample
+
+fold_acc %>%
+  mutate(placeholder = 'placeholder') %>%
+  ggplot(aes(x = placeholder, y = Accuracy, fill = placeholder)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(size = 4, width = .25) +
+  theme_bw() +
+  labs(
+    title = 'Mean accuracy for each fold/resample using optimal hyperparameters',
+    x = '',
+    y = 'Mean Accuracy'
+  ) +
+  theme(
+    axis.text.x=element_blank(),
+    axis.ticks.x=element_blank(),
+    title = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 10),
+    legend.position = 'none')
+
+```
+
+Doh! It looks like our test set accuracy (~64%) is just below the IQR. This means that our selected hyperparameters better suited our train set, and thus we did overfit some.
+
+
+# Conclusion
+
+In sum, it appears that we can only slightly predict the survival of a patient based on their relative gene expression values for these 112 genes. However, this is only slightly better than the no-information-rate (57%), which can be considered a naive model (i.e. the model simply guesses the most abundant class). Thus, one cannot really deduce that, at a whole, these genes can predict overall survival. A future direction could include the incorporation of other metadata and mutational information, which may better encompass the factors leading to patient survival.
+
